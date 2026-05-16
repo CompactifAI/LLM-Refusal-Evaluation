@@ -61,17 +61,16 @@ def delete_llm(llm: Union[LLM, None]):
         except (AttributeError, TypeError):
             continue
 
+    try:
+        del llm.llm_engine
+    except AttributeError:
+        pass
+
     del llm
     with contextlib.suppress(AssertionError):
         torch.distributed.destroy_process_group()
     gc.collect()
     torch.cuda.empty_cache()
-    try:
-        import ray
-
-        ray.shutdown()
-    except ImportError:
-        pass  # ray not available (vllm >= 0.18 dropped it)
     try:
         vram_usage_after = torch.cuda.memory_allocated() / 1024**2
     except AttributeError:
@@ -101,13 +100,24 @@ def encode_conversation(
     batch_messages = []
     truncation_count = 0
     for example in conversations:
-        conv = tokenizer.apply_chat_template(
-            example, tokenize=False, add_generation_prompt=add_generation_prompt
-        )
+        try:
+            conv = tokenizer.apply_chat_template(
+                example, tokenize=False, add_generation_prompt=add_generation_prompt
+            )
+        except AttributeError:
+            # Tokenizer doesn't support chat templates, use fallback
+            conv = "\n".join(
+                f"{msg['role']}: {msg['content']}" for msg in example
+            )
 
         if strip_prompt:
             conv = conv.strip()
         conv = tokenizer.encode(conv, return_tensors=None)
+        # Check for invalid configuration
+        if max_model_len <= max_new_tokens:
+            raise ValueError(
+                f"max_model_len ({max_model_len}) must be greater than max_new_tokens ({max_new_tokens})"
+            )
         if len(conv) > (max_model_len - max_new_tokens):
             if truncation_count == 0:
                 print(

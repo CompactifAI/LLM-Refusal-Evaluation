@@ -28,9 +28,13 @@ def geom_mean_prob(logs: List[float]) -> float:
         Returns -1.0 when no tokens are provided (sentinel for "no segment").
     """
     if logs is None or len(logs) == 0:
-        return -1.0
-    avg_log = math.fsum(logs) / len(logs)
-    return math.exp(avg_log)
+        return -1.0  # sentinel for "no segment"
+    avg_log = torch.tensor(logs, dtype=torch.float32).mean()
+    try:
+        return float(torch.exp(avg_log).item())
+    except (OverflowError, RuntimeError):
+        # If exp(avg_log) overflows, return 1.0 (effectively 100% probability)
+        return 1.0
 
 
 class TokenCandidate(Protocol):
@@ -74,12 +78,24 @@ def parse_log_progs(
     else:
         current = logprobs_think
 
+    # Track accumulated decoded tokens to match multi-token thinking_string
+    accumulated_text = ""
+
     for output in logprobs:
-        values = output.values()
+        values = list(output.values())
+        if not values:
+            # Skip positions with no logprob data
+            continue
         chosen = max(values, key=lambda x: x.rank)
+
+        if thinking_string is not None:
+            accumulated_text += chosen.decoded_token
+            # Check if the thinking_string appears at the end of accumulated text
+            # Switch to answer segment BEFORE appending logprob for delimiter tokens
+            if accumulated_text.endswith(thinking_string):
+                current = logprobs_answer
+
         current.append(chosen.logprob)
-        if thinking_string is not None and chosen.decoded_token == thinking_string:
-            current = logprobs_answer
 
     if thinking_string is None:
         answer_prob = geom_mean_prob(logprobs_answer)
@@ -150,6 +166,9 @@ class GenerateAnswers:
             - "answer_prob": Geometric-mean probability of answer segment (float).
             - "cum": Combined geometric-mean probability across segments (float).
         """
+        if not questions:
+            return []
+
         sampling_params = SamplingParams(
             max_tokens=max_new_tokens,
             top_p=1.0,
@@ -203,7 +222,7 @@ class GenerateAnswers:
         self.close()
 
     def close(self):
-        """
-        Delete the LLM instance and free the GPU memory.
-        """
-        delete_llm(self.llm)
+        """Delete the LLM instance and free the GPU memory."""
+        if hasattr(self, "llm"):
+            delete_llm(self.llm)
+            self.llm = None

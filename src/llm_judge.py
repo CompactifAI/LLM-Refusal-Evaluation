@@ -82,6 +82,9 @@ class LLMJudge:
         Returns:
             List of dicts with 'label' (float) and 'judge_outputs' (List[str]).
         """
+        if not questions_answers:
+            return []
+
         sampling_params = SamplingParams(
             temperature=temperature,
             top_p=top_p,
@@ -148,3 +151,4 @@ class LLMJudge:
     def close(self):
         if hasattr(self, "llm"):
             delete_llm(self.llm)
+            self.llm = None
