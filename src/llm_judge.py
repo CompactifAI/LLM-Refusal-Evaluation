@@ -6,9 +6,12 @@ from vllm import LLM, SamplingParams, TokensPrompt
 
 from src.refusal_judge_prompt import (
     extract_refusal_score,
-    get_refusal_judge_prompt,
+    get_judge_system_prompt,
+    get_judge_user_prompt,
 )
 from src.utils import delete_llm, encode_conversation
+
+_SYSTEM_PROMPT = get_judge_system_prompt()
 
 
 class LLMJudge:
@@ -18,6 +21,10 @@ class LLMJudge:
     Uses a specified LLM to analyze question-answer pairs and classify whether
     the answer represents a refusal to answer or a genuine attempt to address
     the question.
+
+    The instruction block (~6200 tokens) is placed in a system message so that
+    vLLM's prefix caching computes the KV cache once and reuses it for every
+    request, avoiding repeated prefill of the shared instructions.
     """
 
     def __init__(
@@ -26,35 +33,22 @@ class LLMJudge:
         max_model_len: int,
         gpu_memory_utilization: float = 0.95,
         tensor_parallel_size: int = torch.cuda.device_count(),
+        kv_cache_dtype: str = "auto",
     ) -> None:
-        """
-        Initialize the LLM judge with specified model and configuration.
-
-        Args:
-            model_name (str): Name or path of the model to use for judging
-            max_model_len (int): Maximum sequence length for the model
-            gpu_memory_utilization (float, optional): Fraction of GPU memory to use.
-                                                     Defaults to 0.95
-            tensor_parallel_size (int, optional): Number of GPUs for tensor parallelism.
-                                                 Defaults to number of available GPUs
-
-        Returns:
-            None
-        """
         self.model_name = model_name
         self.max_model_len = max_model_len
         self.gpu_memory_utilization = gpu_memory_utilization
         self.tensor_parallel_size = tensor_parallel_size
         self.llm = LLM(
             model=model_name,
-            max_model_len=max_model_len,
             gpu_memory_utilization=gpu_memory_utilization,
             dtype="bfloat16" if torch.cuda.is_bf16_supported() else "float16",
             tensor_parallel_size=tensor_parallel_size,
-            enable_prefix_caching=True,  # We use the same large prompt with the instructions for every input
+            enforce_eager=False,
+            kv_cache_dtype=kv_cache_dtype,
+            max_model_len=max_model_len,
         )
 
-        self.get_judge_prompt = get_refusal_judge_prompt
         self.extract_score = extract_refusal_score
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -77,26 +71,16 @@ class LLMJudge:
         the question. Returns classification scores and judge outputs.
 
         Args:
-            questions_answers (List[Tuple[str, str]]): List of questions and answers.
-                                                       where each question and answer is a tuple.
-            temperature (float, optional): Sampling temperature for generation.
-                                         Defaults to 0.6
-            top_p (float, optional): Top-p (nucleus) sampling parameter.
-                                   Defaults to 0.95
-            top_k (int, optional): Top-k sampling parameter. Defaults to 20
-            max_new_tokens (int, optional): Maximum tokens to generate. Defaults to 8196
-            thinking_string (Optional[str], optional): String to split on for
-                                                     chain-of-thought reasoning.
-                                                     If provided, only text after this
-                                                     string is used for scoring.
-                                                     Defaults to None
+            questions_answers: List of (question, answer) tuples.
+            num_return_sequences: Number of sampled outputs per input.
+            temperature: Sampling temperature.
+            top_p: Top-p (nucleus) sampling parameter.
+            top_k: Top-k sampling parameter.
+            max_new_tokens: Maximum tokens to generate.
+            thinking_string: String to split on for chain-of-thought reasoning.
 
         Returns:
-            List[Dict[str, Union[str, float, List[str]]]]: List of judgment results,
-                where each result contains:
-                - 'label' (float): Average refusal score (1.0=refusal, -1.0=not refusal,
-                                 0.0=error)
-                - 'judge_outputs' (List[str]): Raw judge response texts
+            List of dicts with 'label' (float) and 'judge_outputs' (List[str]).
         """
         sampling_params = SamplingParams(
             temperature=temperature,
@@ -107,7 +91,10 @@ class LLMJudge:
         )
 
         conversations: List[List[Dict[str, str]]] = [
-            [{"role": "user", "content": self.get_judge_prompt(question, answer)}]
+            [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": get_judge_user_prompt(question, answer)},
+            ]
             for question, answer in questions_answers
         ]
 
@@ -118,7 +105,6 @@ class LLMJudge:
             max_new_tokens=max_new_tokens,
         )
 
-        # Normalize empty thinking strings to None so downstream split logic is safe
         if thinking_string == "":
             thinking_string = None
 
@@ -160,8 +146,5 @@ class LLMJudge:
         self.close()
 
     def close(self):
-        """
-        Delete the LLM instance and free the GPU memory.
-        """
         if hasattr(self, "llm"):
             delete_llm(self.llm)

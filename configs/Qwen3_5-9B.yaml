@@ -29,7 +29,7 @@ judge_model:
 
 
 continue_from_checkpoint: true
-enforce_eager: true
+enforce_eager: false
 gpu_memory_utilization: 0.80
 tensor_parallel_size: "auto" # use all available GPUs
 

@@ -9,7 +9,7 @@ dependencies = [
     "matplotlib>=3.10.8",
     "numpy>=2.2.0",
     "pyyaml>=6.0.3",
-    "vllm>=0.18.0",
+    "vllm>=0.21.0",
 ]
 
 # Override vllm's transformers<5 constraint to get qwen3_5 model support.

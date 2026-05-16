@@ -30,7 +30,7 @@ judge_model:
   batch_size: 64
 
 continue_from_checkpoint: false
-enforce_eager: true
+enforce_eager: false
 gpu_memory_utilization: 0.80
 tensor_parallel_size: "auto"
 

@@ -1,6 +1,6 @@
 dataset_splits:
-  - dataset_id: "PKU-Alignment/BeaverTails-Evaluation"
-    split: "test"
+  - dataset_id: "PKU-Alignment/BeaverTails"
+    split: "30k_test"
     prompt_column: "prompt"
   - dataset_id: "Iker/refusal-evaluation"
     split: "general_prompts"
@@ -33,4 +33,4 @@ enforce_eager: false
 gpu_memory_utilization: 0.80
 tensor_parallel_size: "auto"
 
-output_dir: "results/Qwen3.5-9B-beavertails"
+output_dir: "results/Qwen3.5-9B-beavertails2"

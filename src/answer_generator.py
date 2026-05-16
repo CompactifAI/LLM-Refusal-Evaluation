@@ -1,3 +1,4 @@
+import math
 from typing import (
     Dict,
     List,
@@ -12,7 +13,6 @@ from typing import (
 import torch
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams, TokensPrompt
-from vllm.config.compilation import CUDAGraphMode
 
 from src.utils import delete_llm, encode_conversation
 
@@ -28,9 +28,9 @@ def geom_mean_prob(logs: List[float]) -> float:
         Returns -1.0 when no tokens are provided (sentinel for "no segment").
     """
     if logs is None or len(logs) == 0:
-        return -1.0  # sentinel for "no segment"
-    avg_log = torch.tensor(logs, dtype=torch.float32).mean()
-    return float(torch.exp(avg_log).item())
+        return -1.0
+    avg_log = math.fsum(logs) / len(logs)
+    return math.exp(avg_log)
 
 
 class TokenCandidate(Protocol):
@@ -105,28 +105,20 @@ class GenerateAnswers:
         gpu_memory_utilization: float = 0.95,
         tensor_parallel_size: int = torch.cuda.device_count(),
         enforce_eager: bool = False,
+        kv_cache_dtype: str = "auto",
     ):
-        """Initialize a text-generation model runner.
-
-        Args:
-            model_name: Hugging Face model identifier or local path.
-            max_model_len: Maximum context length for the model.
-            gpu_memory_utilization: Fraction of GPU memory to allocate to the model.
-            tensor_parallel_size: Degree of tensor parallelism across GPUs.
-            enforce_eager: Whether to enforce eager mode.
-        """
         self.model_name = model_name
         self.max_model_len = max_model_len
         self.gpu_memory_utilization = gpu_memory_utilization
 
         self.llm = LLM(
             model=model_name,
-            max_model_len=max_model_len,
             gpu_memory_utilization=gpu_memory_utilization,
             dtype="bfloat16" if torch.cuda.is_bf16_supported() else "float16",
             tensor_parallel_size=tensor_parallel_size,
-            enable_prefix_caching=False,  # Not useful as we do not run the same prompt multiple times
             enforce_eager=enforce_eager,
+            kv_cache_dtype=kv_cache_dtype,
+            max_model_len=max_model_len,
         )
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)

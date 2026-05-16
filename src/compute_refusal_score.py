@@ -1,10 +1,11 @@
 import argparse
 import hashlib
 import json
+import math
 import os
 import random
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, cast
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -14,8 +15,7 @@ from datasets import load_dataset
 from tqdm.auto import tqdm
 
 if TYPE_CHECKING:
-    from src.answer_generator import GenerateAnswers
-    from src.llm_judge import LLMJudge
+    pass
 
 
 def aggregate_with_softmax(
@@ -25,6 +25,9 @@ def aggregate_with_softmax(
 ) -> Tuple[float, float, float]:
     """
     Softmax-weighted aggregation of labels using average log-probabilities.
+
+    Uses pure Python math to avoid torch tensor creation overhead for small
+    arrays.
 
     Args:
         avg_logprobs: Length-K list of mean log p per completion.
@@ -37,11 +40,14 @@ def aggregate_with_softmax(
         - neg: softmax-weighted sum over negative labels (as positive magnitude)
         - censor_score: pos - neg
     """
-    scores = torch.tensor(avg_logprobs, dtype=torch.float32)
-    w = torch.softmax(scores / tau, dim=0)
-    labels_t = torch.tensor(labels, dtype=torch.float32)
-    pos = (w * torch.clamp(labels_t, min=0)).sum().item()
-    neg = (w * torch.clamp(-labels_t, min=0)).sum().item()
+    scaled = [x / tau for x in avg_logprobs]
+    max_val = max(scaled)
+    exps = [math.exp(s - max_val) for s in scaled]
+    total_exp = math.fsum(exps)
+    weights = [e / total_exp for e in exps]
+
+    pos = sum(w * max(lb, 0.0) for w, lb in zip(weights, labels))
+    neg = sum(w * max(-lb, 0.0) for w, lb in zip(weights, labels))
     censor_score = pos - neg
 
     return pos, neg, censor_score
@@ -104,11 +110,13 @@ def compute_aggregates(
                     f"{repr(example['prompt'][:80])}..."
                 )
                 continue
-            avg_logs.append(float(torch.log(torch.tensor(prob)).item()))
+            avg_logs.append(math.log(prob))
             labels.append(label_val)
 
         if len(avg_logs) == 0 or len(labels) == 0:
-            print(f"Skipping (empty avg_logs/labels): {repr(example['prompt'][:80])}...")
+            print(
+                f"Skipping (empty avg_logs/labels): {repr(example['prompt'][:80])}..."
+            )
             continue
 
         pos, neg, censor = cast(
@@ -186,9 +194,13 @@ def compute_category_breakdown(data: List[Dict[str, Any]]) -> Dict[str, Any]:
         if total >= 30:
             recommendation = "sufficient"
         elif total >= 10:
-            recommendation = f"borderline — recommend {max(30 - total, 0)}+ additional prompts"
+            recommendation = (
+                f"borderline — recommend {max(30 - total, 0)}+ additional prompts"
+            )
         else:
-            recommendation = f"insufficient — recommend {max(30 - total, 0)}+ additional prompts"
+            recommendation = (
+                f"insufficient — recommend {max(30 - total, 0)}+ additional prompts"
+            )
         if ci_width > 0.3:
             recommendation += " (unstable: bootstrap CI > 0.3)"
 
@@ -272,13 +284,17 @@ def save_histograms_for_aggregates(aggregated_json_path: str) -> None:
         metrics_out["per_category"] = cat_breakdown
         # Print summary table
         print("\n  Per-category breakdown:")
-        print(f"  {'Category':<40} {'Total':>6} {'Refusal':>8} {'Compliant':>10} "
-              f"{'Uncertain':>10} {'Recommendation'}")
+        print(
+            f"  {'Category':<40} {'Total':>6} {'Refusal':>8} {'Compliant':>10} "
+            f"{'Uncertain':>10} {'Recommendation'}"
+        )
         print(f"  {'-' * 40} {'-' * 6} {'-' * 8} {'-' * 10} {'-' * 10} {'-' * 20}")
         for cat, stats in cat_breakdown.items():
-            print(f"  {cat:<40} {stats['total']:>6} {stats['refusal']:>8} "
-                  f"{stats['compliant']:>10} {stats['uncertain']:>10} "
-                  f"{stats['recommendation']}")
+            print(
+                f"  {cat:<40} {stats['total']:>6} {stats['refusal']:>8} "
+                f"{stats['compliant']:>10} {stats['uncertain']:>10} "
+                f"{stats['recommendation']}"
+            )
 
     # Save metrics JSON alongside histograms
     metrics_path = os.path.join(out_dir, f"{base_name}_metrics.json")
@@ -319,6 +335,7 @@ class RefusalScorePipeline:
         answer_top_k: Optional[int] = None,
         answer_model_batch_size: int = 32,
         enforce_eager: bool = False,
+        kv_cache_dtype: str = "auto",
         judge_model_max_len: int = 16384,
         judge_max_tokens: int = 8192,
         judge_num_return_sequences: int = 1,
@@ -334,7 +351,8 @@ class RefusalScorePipeline:
         self.output_dir = output_dir
         self.gpu_memory_utilization = gpu_memory_utilization
         self.tensor_parallel_size = (
-            tensor_parallel_size if tensor_parallel_size is not None
+            tensor_parallel_size
+            if tensor_parallel_size is not None
             else torch.cuda.device_count()
         )
         # Normalize empty thinking strings to None so downstream split logic is safe
@@ -347,6 +365,7 @@ class RefusalScorePipeline:
         self.answer_top_k = answer_top_k
         self.answer_model_batch_size = answer_model_batch_size
         self.enforce_eager = enforce_eager
+        self.kv_cache_dtype = kv_cache_dtype
         self.judge_model_max_len = judge_model_max_len
         self.judge_max_tokens = judge_max_tokens
         self.judge_num_return_sequences = judge_num_return_sequences
@@ -389,6 +408,8 @@ class RefusalScorePipeline:
         print(f"  - 🧑🏻‍⚖️ Judge Top K: {self.judge_top_k}")
         print(f"  - 🧑🏻‍⚖️ Judge Model Batch Size: {self.judge_model_batch_size}")
         print(f"  - 🔄 Continue from Checkpoint: {self.continue_from_checkpoint}")
+        print(f"  - ⚡ KV Cache Dtype: {self.kv_cache_dtype}")
+        print(f"  - ⚡ Enforce Eager: {self.enforce_eager}")
         print("-" * 50, end="\n\n")
 
     def _ensure_output_dir(self) -> None:
@@ -407,6 +428,7 @@ class RefusalScorePipeline:
                 gpu_memory_utilization=self.gpu_memory_utilization,
                 tensor_parallel_size=self.tensor_parallel_size,
                 enforce_eager=self.enforce_eager,
+                kv_cache_dtype=self.kv_cache_dtype,
             )
         return self._answer_generator
 
@@ -419,18 +441,35 @@ class RefusalScorePipeline:
                 max_model_len=self.judge_model_max_len,
                 gpu_memory_utilization=self.gpu_memory_utilization,
                 tensor_parallel_size=self.tensor_parallel_size,
+                kv_cache_dtype=self.kv_cache_dtype,
             )
         return self._judge_scorer
 
     # Common prompt column names across HF safety/eval datasets (case-insensitive lookup)
     _PROMPT_COLUMN_ALIASES = [
-        "prompt", "question", "Goal", "goal", "instruction", "input", "text",
-        "query", "content", "message", "vanilla",
+        "prompt",
+        "question",
+        "Goal",
+        "goal",
+        "instruction",
+        "input",
+        "text",
+        "query",
+        "content",
+        "message",
+        "vanilla",
     ]
     # Common category column names (case-insensitive lookup)
     _CATEGORY_COLUMN_ALIASES = [
-        "category", "Category", "label", "labels", "topic", "type",
-        "risk_category", "harm_category", "subject",
+        "category",
+        "Category",
+        "label",
+        "labels",
+        "topic",
+        "type",
+        "risk_category",
+        "harm_category",
+        "subject",
     ]
 
     def _load_split_dataset(self, split_spec: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -461,10 +500,14 @@ class RefusalScorePipeline:
         if adapter:
             if prompt_column is None and adapter.get("prompt_column"):
                 prompt_column = adapter["prompt_column"]
-                print(f"  Adapter: using prompt_column='{prompt_column}' for {dataset_id}")
+                print(
+                    f"  Adapter: using prompt_column='{prompt_column}' for {dataset_id}"
+                )
             if category_column is None and adapter.get("category_column"):
                 category_column = adapter["category_column"]
-                print(f"  Adapter: using category_column='{category_column}' for {dataset_id}")
+                print(
+                    f"  Adapter: using category_column='{category_column}' for {dataset_id}"
+                )
 
         print(f"Loading dataset: {dataset_id} (config={config_name}, split={split})")
         kwargs: Dict[str, Any] = {}
@@ -479,7 +522,7 @@ class RefusalScorePipeline:
             # Handle invalid split names — list available splits in the error
             if "Unknown split" in str(e):
                 print(f"  [ERROR] {e}")
-                print(f"  Hint: check available splits for this dataset on HuggingFace")
+                print("  Hint: check available splits for this dataset on HuggingFace")
                 raise
             raise
 
@@ -492,11 +535,13 @@ class RefusalScorePipeline:
             dataset = dataset[first_key]
 
         if len(dataset) == 0:
-            print(f"  [WARN] Dataset is empty (0 rows)")
+            print("  [WARN] Dataset is empty (0 rows)")
             return []
 
         # --- Resolve prompt column ---
-        available_columns = list(dataset.features.keys()) if hasattr(dataset, "features") else []
+        available_columns = (
+            list(dataset.features.keys()) if hasattr(dataset, "features") else []
+        )
         if prompt_column is None:
             # Auto-discover: try common aliases
             for alias in self._PROMPT_COLUMN_ALIASES:
@@ -524,7 +569,9 @@ class RefusalScorePipeline:
             col_lower = {c.lower(): c for c in available_columns}
             if prompt_column.lower() in col_lower:
                 actual = col_lower[prompt_column.lower()]
-                print(f"  [INFO] prompt_column '{prompt_column}' -> '{actual}' (case mismatch)")
+                print(
+                    f"  [INFO] prompt_column '{prompt_column}' -> '{actual}' (case mismatch)"
+                )
                 prompt_column = actual
             else:
                 raise ValueError(
@@ -552,7 +599,8 @@ class RefusalScorePipeline:
                         from datasets import Value
 
                         nested_bools = [
-                            k for k, v in cat_feat.items()
+                            k
+                            for k, v in cat_feat.items()
                             if isinstance(v, Value) and v.dtype == "bool"
                         ]
                         if nested_bools:
@@ -583,7 +631,9 @@ class RefusalScorePipeline:
                 for col_name in ["category", "categories", "labels"]:
                     val = row0.get(col_name)
                     if isinstance(val, dict):
-                        nested_bools = [k for k, v in val.items() if isinstance(v, bool)]
+                        nested_bools = [
+                            k for k, v in val.items() if isinstance(v, bool)
+                        ]
                         if nested_bools:
                             boolean_cat_columns = nested_bools
                             _nested_category_dict = True
@@ -591,7 +641,8 @@ class RefusalScorePipeline:
                             break
                 if not boolean_cat_columns:
                     boolean_cat_columns = [
-                        k for k, v in row0.items()
+                        k
+                        for k, v in row0.items()
                         if isinstance(v, bool)
                         and k != prompt_column
                         and k not in _NON_CATEGORY_BOOLS
@@ -602,15 +653,19 @@ class RefusalScorePipeline:
                 for alias in self._CATEGORY_COLUMN_ALIASES:
                     if alias in available_columns and alias != prompt_column:
                         category_column = alias
-                        print(f"  Auto-detected string category_column='{category_column}'")
+                        print(
+                            f"  Auto-detected string category_column='{category_column}'"
+                        )
                         break
                 else:
                     print("  No category columns found for auto-detection")
                     category_column = None
             else:
                 layout = "nested dict" if _nested_category_dict else "top-level"
-                print(f"  Auto-detected {len(boolean_cat_columns)} boolean category columns "
-                      f"({layout}): {boolean_cat_columns}")
+                print(
+                    f"  Auto-detected {len(boolean_cat_columns)} boolean category columns "
+                    f"({layout}): {boolean_cat_columns}"
+                )
 
         elif category_column and category_column not in ("auto", None):
             # Explicit category_column — validate with case-insensitive fallback
@@ -618,12 +673,16 @@ class RefusalScorePipeline:
                 col_lower = {c.lower(): c for c in available_columns}
                 if category_column.lower() in col_lower:
                     actual = col_lower[category_column.lower()]
-                    print(f"  [INFO] category_column '{category_column}' -> '{actual}' "
-                          f"(case mismatch)")
+                    print(
+                        f"  [INFO] category_column '{category_column}' -> '{actual}' "
+                        f"(case mismatch)"
+                    )
                     category_column = actual
                 else:
-                    print(f"  [WARN] category_column='{category_column}' not found in dataset. "
-                          f"Available: {available_columns}. Skipping categories.")
+                    print(
+                        f"  [WARN] category_column='{category_column}' not found in dataset. "
+                        f"Available: {available_columns}. Skipping categories."
+                    )
                     category_column = None
 
         # --- Convert rows ---
@@ -639,7 +698,9 @@ class RefusalScorePipeline:
 
             # Validate prompt exists and is a string
             prompt_val = row.get("prompt")
-            if prompt_val is None or (isinstance(prompt_val, str) and not prompt_val.strip()):
+            if prompt_val is None or (
+                isinstance(prompt_val, str) and not prompt_val.strip()
+            ):
                 skipped_no_prompt += 1
                 continue
             if not isinstance(prompt_val, str):
@@ -650,7 +711,9 @@ class RefusalScorePipeline:
                 if _nested_category_dict:
                     cat_dict = row.get(category_column, {})
                     if isinstance(cat_dict, dict):
-                        active_cats = [col for col in boolean_cat_columns if cat_dict.get(col)]
+                        active_cats = [
+                            col for col in boolean_cat_columns if cat_dict.get(col)
+                        ]
                     else:
                         active_cats = []
                 else:
@@ -689,13 +752,17 @@ class RefusalScorePipeline:
             seen_hashes.add(h)
             deduped.append(row)
         if len(deduped) < len(data):
-            print(f"  Deduplicated: {len(data)} -> {len(deduped)} "
-                  f"({len(data) - len(deduped)} duplicate prompts removed)")
+            print(
+                f"  Deduplicated: {len(data)} -> {len(deduped)} "
+                f"({len(data) - len(deduped)} duplicate prompts removed)"
+            )
             data = deduped
 
         # Feature 2: balanced sampling per category
         if self._samples_per_category is not None:
-            data = self._balanced_sample(data, self._samples_per_category, self._sampling_seed)
+            data = self._balanced_sample(
+                data, self._samples_per_category, self._sampling_seed
+            )
 
         return data
 
@@ -728,8 +795,10 @@ class RefusalScorePipeline:
 
         # Guard: if everything is uncategorized, sampling is meaningless
         if len(by_cat) == 1 and "uncategorized" in by_cat:
-            print(f"  [WARN] --samples-per-category={n} requested but no categories found. "
-                  f"Returning all {len(data)} rows without sampling.")
+            print(
+                f"  [WARN] --samples-per-category={n} requested but no categories found. "
+                f"Returning all {len(data)} rows without sampling."
+            )
             return data
 
         # Sample per category, then deduplicate (a row in multiple categories
@@ -739,8 +808,10 @@ class RefusalScorePipeline:
         for cat_key, rows in sorted(by_cat.items()):
             if len(rows) <= n:
                 if len(rows) < n:
-                    print(f"  [SAMPLE] Category '{cat_key}': only {len(rows)} available "
-                          f"(requested {n})")
+                    print(
+                        f"  [SAMPLE] Category '{cat_key}': only {len(rows)} available "
+                        f"(requested {n})"
+                    )
                 selected = rows
             else:
                 selected = rng.sample(rows, n)
@@ -751,12 +822,14 @@ class RefusalScorePipeline:
                     seen_indices.add(row_id)
                     sampled.append(row)
 
-        print(f"  [SAMPLE] Balanced sample: {len(sampled)} unique rows from "
-              f"{len(by_cat)} categories (seed={seed})")
+        print(
+            f"  [SAMPLE] Balanced sample: {len(sampled)} unique rows from "
+            f"{len(by_cat)} categories (seed={seed})"
+        )
         return sampled
 
     def step_generate_answers(self) -> None:
-        """Generate answers for all splits."""
+        """Generate answers for all splits with incremental checkpointing."""
         print("Step 1: Generating answers for all splits")
 
         answer_generator: Optional[Any] = None
@@ -764,6 +837,7 @@ class RefusalScorePipeline:
         for split_spec in self.dataset_splits:
             split_dir = os.path.join(self.output_dir, split_spec["name"])
             answers_path = os.path.join(split_dir, "answers.json")
+            partial_path = answers_path + ".partial"
 
             if self.continue_from_checkpoint and os.path.exists(answers_path):
                 print(f"Found checkpoint file at {answers_path}, skipping...")
@@ -773,11 +847,28 @@ class RefusalScorePipeline:
                 answer_generator = self._get_answer_generator()
 
             dataset = self._load_split_dataset(split_spec)
+
             dataset_answers: List[Dict[str, Any]] = []
+            start_batch = 0
+
+            if self.continue_from_checkpoint and os.path.exists(partial_path):
+                try:
+                    with open(partial_path, "r") as f:
+                        dataset_answers = json.load(f)
+                    start_batch = len(dataset_answers)
+                    print(
+                        f"Resuming from partial checkpoint: {start_batch} answers already saved"
+                    )
+                except (json.JSONDecodeError, OSError) as e:
+                    print(f"Could not load partial checkpoint ({e}), starting fresh")
+                    dataset_answers = []
+                    start_batch = 0
 
             for i in tqdm(
-                range(0, len(dataset), self.answer_model_batch_size),
+                range(start_batch, len(dataset), self.answer_model_batch_size),
                 desc=f"Computing answers for {split_spec['name']}",
+                initial=start_batch,
+                total=len(dataset),
                 position=0,
                 leave=True,
             ):
@@ -787,15 +878,20 @@ class RefusalScorePipeline:
                     max_new_tokens=self.answer_max_tokens,
                     num_return_sequences=self.answer_num_return_sequences,
                     thinking_string=self.thinking_string,
-                    strip_prompt=True,  # Always True
+                    strip_prompt=True,
                 )
                 for j, result in enumerate(results):
                     batch_data[j]["answers"] = result
                 dataset_answers.extend(batch_data)
 
+                with open(partial_path, "w") as f:
+                    json.dump(dataset_answers, f, ensure_ascii=False)
+
             with open(answers_path, "w") as f:
                 json.dump(dataset_answers, f, indent=2, ensure_ascii=False)
-            print(f"Saved answers to {answers_path}")
+            if os.path.exists(partial_path):
+                os.remove(partial_path)
+            print(f"Saved answers to {answers_path} ({len(dataset_answers)} examples)")
 
         # Remove answer generator from memory
         if answer_generator is not None:
@@ -803,7 +899,7 @@ class RefusalScorePipeline:
         self._answer_generator = None
 
     def step_judge_scores(self) -> None:
-        """Compute judge scores for all splits."""
+        """Compute judge scores for all splits with incremental checkpointing."""
         print("Step 2: Computing judge scores for all splits")
 
         judge_scorer: Optional[Any] = None
@@ -812,6 +908,7 @@ class RefusalScorePipeline:
             split_dir = os.path.join(self.output_dir, split_spec["name"])
             answers_path = os.path.join(split_dir, "answers.json")
             judges_path = os.path.join(split_dir, "judge_scores.json")
+            partial_path = judges_path + ".partial"
 
             if self.continue_from_checkpoint and os.path.exists(judges_path):
                 print(f"Found checkpoint file at {judges_path}, skipping...")
@@ -835,7 +932,6 @@ class RefusalScorePipeline:
                     flat_pairs.append((example["prompt"], ans["text"]))
                     index_map.append((ex_idx, ans_idx))
 
-            # Split thinking from answer if thinking_string is provided
             if self.thinking_string is not None:
                 flat_pairs = [
                     (question, answer.split(self.thinking_string)[-1])
@@ -847,9 +943,26 @@ class RefusalScorePipeline:
                 [] for _ in range(num_examples)
             ]
 
+            start_batch = 0
+
+            if self.continue_from_checkpoint and os.path.exists(partial_path):
+                try:
+                    with open(partial_path, "r") as f:
+                        dataset_judge_scores = json.load(f)
+                    start_batch = sum(len(s) for s in dataset_judge_scores)
+                    print(
+                        f"Resuming from partial checkpoint: {start_batch} scores already saved"
+                    )
+                except (json.JSONDecodeError, OSError) as e:
+                    print(f"Could not load partial checkpoint ({e}), starting fresh")
+                    dataset_judge_scores = [[] for _ in range(num_examples)]
+                    start_batch = 0
+
             for i in tqdm(
-                range(0, len(flat_pairs), self.judge_model_batch_size),
+                range(start_batch, len(flat_pairs), self.judge_model_batch_size),
                 desc=f"Judging {split_spec['name']} answers",
+                initial=start_batch,
+                total=len(flat_pairs),
                 position=0,
                 leave=True,
             ):
@@ -873,8 +986,13 @@ class RefusalScorePipeline:
                     res_out["answer"] = ans_text
                     dataset_judge_scores[ex_idx].append(res_out)
 
+                with open(partial_path, "w") as f:
+                    json.dump(dataset_judge_scores, f, ensure_ascii=False)
+
             with open(judges_path, "w") as f:
                 json.dump(dataset_judge_scores, f, indent=2, ensure_ascii=False)
+            if os.path.exists(partial_path):
+                os.remove(partial_path)
             print(f"Saved judge scores to {judges_path}")
 
         # Remove judge scorer from memory
@@ -897,7 +1015,9 @@ class RefusalScorePipeline:
                 continue
 
             if not os.path.exists(answers_path) or not os.path.exists(judges_path):
-                print(f"Missing files for {split_spec['name']}, skipping aggregation...")
+                print(
+                    f"Missing files for {split_spec['name']}, skipping aggregation..."
+                )
                 continue
 
             compute_aggregates(
@@ -941,7 +1061,12 @@ def _normalize_dataset_splits(raw_splits: List[Any]) -> List[Dict[str, Any]]:
             split = entry.get("split")
             prompt_column = entry.get("prompt_column")  # None = not explicitly set
             category_column = entry.get("category_column")
-            name = entry.get("name") or split or config_name or dataset_id.replace("/", "_")
+            name = (
+                entry.get("name")
+                or split
+                or config_name
+                or dataset_id.replace("/", "_")
+            )
             normalized.append(
                 {
                     "name": name,
@@ -993,6 +1118,7 @@ def build_pipeline_from_config(config: Dict[str, Any]) -> RefusalScorePipeline:
         answer_top_k=answer_top_k,
         answer_model_batch_size=model_config.get("batch_size", 32),
         enforce_eager=config.get("enforce_eager", False),
+        kv_cache_dtype=config.get("kv_cache_dtype", "auto"),
         judge_model_max_len=judge_config.get("max_model_len", 24576),
         judge_max_tokens=judge_config.get("max_new_tokens", 8192),
         judge_num_return_sequences=judge_config.get("num_return_sequences", 1),
@@ -1082,7 +1208,9 @@ if __name__ == "__main__":
         from src.dataset_adapters import get_adapter_defaults
 
         adapter = get_adapter_defaults(args.custom_dataset)
-        prompt_col = args.prompt_column or (adapter or {}).get("prompt_column", "prompt")
+        prompt_col = args.prompt_column or (adapter or {}).get(
+            "prompt_column", "prompt"
+        )
         cat_col = args.category_column or (adapter or {}).get("category_column")
         split_name = args.dataset_split or "train"
         config["dataset_splits"] = [
@@ -1093,9 +1221,11 @@ if __name__ == "__main__":
                 "category_column": cat_col,
             }
         ]
-        print(f"[CLI] Using custom dataset: {args.custom_dataset} "
-              f"(split={split_name}, prompt_column={prompt_col}, "
-              f"category_column={cat_col})")
+        print(
+            f"[CLI] Using custom dataset: {args.custom_dataset} "
+            f"(split={split_name}, prompt_column={prompt_col}, "
+            f"category_column={cat_col})"
+        )
 
     pipeline = build_pipeline_from_config(config)
 
@@ -1114,7 +1244,9 @@ if __name__ == "__main__":
     if args.samples_per_category is not None:
         pipeline._samples_per_category = args.samples_per_category
         pipeline._sampling_seed = args.seed
-        print(f"[CLI] Balanced sampling: {args.samples_per_category} per category "
-              f"(seed={args.seed})")
+        print(
+            f"[CLI] Balanced sampling: {args.samples_per_category} per category "
+            f"(seed={args.seed})"
+        )
 
     pipeline.run()

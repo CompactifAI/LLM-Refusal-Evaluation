@@ -176,8 +176,13 @@ def merge_results(
         for input_dir, split, source_name in sources:
             split_dir = _resolve_split_dir(input_dir, split)
             deduped = _load_and_merge_source(
-                split_dir, source_name, seen_hashes, deduplicate,
-                merged_censor, merged_answers, merged_judges,
+                split_dir,
+                source_name,
+                seen_hashes,
+                deduplicate,
+                merged_censor,
+                merged_answers,
+                merged_judges,
             )
             total_deduped += deduped
 
@@ -191,8 +196,10 @@ def merge_results(
                 json.dump(merged_judges, f, indent=2, ensure_ascii=False)
 
         total_merged += len(merged_censor)
-        print(f"[MERGED] {split_key}: {len(merged_censor)} entries "
-              f"from {len(sources)} source(s)")
+        print(
+            f"[MERGED] {split_key}: {len(merged_censor)} entries "
+            f"from {len(sources)} source(s)"
+        )
 
     print(f"\n[DONE] Merged {total_merged} total entries to {output_dir}")
     if total_deduped > 0:
@@ -237,8 +244,13 @@ def merge_datasets(
             split_dir = _resolve_split_dir(input_dir, split)
             label = source_name if split == "." else f"{source_name}/{split}"
             deduped = _load_and_merge_source(
-                split_dir, label, seen_hashes, deduplicate,
-                merged_censor, merged_answers, merged_judges,
+                split_dir,
+                label,
+                seen_hashes,
+                deduplicate,
+                merged_censor,
+                merged_answers,
+                merged_judges,
             )
             total_deduped += deduped
             count = len(merged_censor) - sum(
@@ -261,8 +273,10 @@ def merge_datasets(
         with open(os.path.join(output_dir, "judge_scores.json"), "w") as f:
             json.dump(merged_judges, f, indent=2, ensure_ascii=False)
 
-    print(f"\n[DONE] Merged {len(merged_censor)} entries from {source_count} source(s) "
-          f"to {output_dir}")
+    print(
+        f"\n[DONE] Merged {len(merged_censor)} entries from {source_count} source(s) "
+        f"to {output_dir}"
+    )
     if total_deduped > 0:
         print(f"  Deduplicated: {total_deduped} duplicate prompts removed")
 

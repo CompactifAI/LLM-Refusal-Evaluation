@@ -68,6 +68,7 @@ def delete_llm(llm: Union[LLM, None]):
     torch.cuda.empty_cache()
     try:
         import ray
+
         ray.shutdown()
     except ImportError:
         pass  # ray not available (vllm >= 0.18 dropped it)

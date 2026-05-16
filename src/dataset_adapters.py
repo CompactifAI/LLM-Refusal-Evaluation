@@ -7,7 +7,6 @@ by dataset ID prefix and auto-selected during loading.
 
 from typing import Dict, Optional
 
-
 # Registry of known dataset adapters.
 # Keys are matched as prefixes against dataset_id (case-insensitive).
 # Values are dicts with column mapping defaults.
