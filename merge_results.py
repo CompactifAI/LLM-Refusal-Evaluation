@@ -23,10 +23,25 @@ Usage:
 
 import argparse
 import hashlib
-import json
 import os
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set
+
+import orjson
+
+
+def _json_load(path: str) -> Any:
+    with open(path, "rb") as f:
+        return orjson.loads(f.read())
+
+
+def _json_save(data: Any, path: str, indent: bool = False) -> None:
+    opts = orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_ENSURE_ASCII
+    if indent:
+        opts |= orjson.OPT_INDENT_2
+    with open(path, "wb") as f:
+        f.write(orjson.dumps(data, option=opts))
+        f.write(b"\n")
 
 
 def compute_prompt_hash(prompt: str) -> str:
@@ -65,8 +80,7 @@ def load_json_safe(path: str) -> Optional[Any]:
     """Load a JSON file, returning None if it doesn't exist."""
     if not os.path.exists(path):
         return None
-    with open(path) as f:
-        return json.load(f)
+    return _json_load(path)
 
 
 def _resolve_split_dir(input_dir: str, split: str) -> str:
@@ -186,14 +200,21 @@ def merge_results(
             )
             total_deduped += deduped
 
-        with open(os.path.join(split_out_dir, "censor_scores.json"), "w") as f:
-            json.dump(merged_censor, f, indent=2, ensure_ascii=False)
+        _json_save(
+            merged_censor,
+            os.path.join(split_out_dir, "censor_scores.json"),
+            indent=True,
+        )
         if merged_answers:
-            with open(os.path.join(split_out_dir, "answers.json"), "w") as f:
-                json.dump(merged_answers, f, indent=2, ensure_ascii=False)
+            _json_save(
+                merged_answers, os.path.join(split_out_dir, "answers.json"), indent=True
+            )
         if merged_judges:
-            with open(os.path.join(split_out_dir, "judge_scores.json"), "w") as f:
-                json.dump(merged_judges, f, indent=2, ensure_ascii=False)
+            _json_save(
+                merged_judges,
+                os.path.join(split_out_dir, "judge_scores.json"),
+                indent=True,
+            )
 
         total_merged += len(merged_censor)
         print(
@@ -264,14 +285,17 @@ def merge_datasets(
         return
 
     # Write flat output (no split subdirectory)
-    with open(os.path.join(output_dir, "censor_scores.json"), "w") as f:
-        json.dump(merged_censor, f, indent=2, ensure_ascii=False)
+    _json_save(
+        merged_censor, os.path.join(output_dir, "censor_scores.json"), indent=True
+    )
     if merged_answers:
-        with open(os.path.join(output_dir, "answers.json"), "w") as f:
-            json.dump(merged_answers, f, indent=2, ensure_ascii=False)
+        _json_save(
+            merged_answers, os.path.join(output_dir, "answers.json"), indent=True
+        )
     if merged_judges:
-        with open(os.path.join(output_dir, "judge_scores.json"), "w") as f:
-            json.dump(merged_judges, f, indent=2, ensure_ascii=False)
+        _json_save(
+            merged_judges, os.path.join(output_dir, "judge_scores.json"), indent=True
+        )
 
     print(
         f"\n[DONE] Merged {len(merged_censor)} entries from {source_count} source(s) "

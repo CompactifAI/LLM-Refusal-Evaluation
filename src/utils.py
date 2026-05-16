@@ -1,7 +1,8 @@
 import contextlib
 import gc
-from typing import Dict, List, Union
+from typing import Any, Dict, List, Union
 
+import orjson
 import torch
 from transformers import PreTrainedTokenizer
 from vllm import LLM, TokensPrompt
@@ -9,6 +10,28 @@ from vllm.distributed.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
 )
+
+
+def json_load(path: str) -> Any:
+    """Load JSON using orjson for speed."""
+    with open(path, "rb") as f:
+        return orjson.loads(f.read())
+
+
+def json_save(data: Any, path: str, indent: bool = False) -> None:
+    """Save JSON using orjson for speed.
+
+    Args:
+        data: Data to serialize.
+        path: Output file path.
+        indent: If True, pretty-print with 2-space indent (for final outputs).
+    """
+    opts = orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_ENSURE_ASCII
+    if indent:
+        opts |= orjson.OPT_INDENT_2
+    with open(path, "wb") as f:
+        f.write(orjson.dumps(data, option=opts))
+        f.write(b"\n")
 
 
 def delete_llm(llm: Union[LLM, None]):
@@ -106,9 +129,7 @@ def encode_conversation(
             )
         except AttributeError:
             # Tokenizer doesn't support chat templates, use fallback
-            conv = "\n".join(
-                f"{msg['role']}: {msg['content']}" for msg in example
-            )
+            conv = "\n".join(f"{msg['role']}: {msg['content']}" for msg in example)
 
         if strip_prompt:
             conv = conv.strip()
